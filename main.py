@@ -23,12 +23,14 @@ def derive_secret_key(username: str, password: str) -> bytes:
     password so that two different encryption keys are generated for users
     with the same password.
     """
+    salt = username + REALM_NAME 
     pass
 
 
 def encrypt(key: bytes, data: Any) -> bytes:
     """Encrypts the given data using AES."""
-    pass
+    """use GCM for AES and dont forget the nonce"""
+    """use pickle to serialize the data from the json object"""
 
 
 def decrypt(key: bytes, data: bytes) -> Any:
