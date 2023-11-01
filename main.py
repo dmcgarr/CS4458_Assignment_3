@@ -23,9 +23,13 @@ def derive_secret_key(username: str, password: str) -> bytes:
     password so that two different encryption keys are generated for users
     with the same password.
     """
-    salt = username + REALM_NAME + password
-    hash = SHA256.new(salt.encode())
-    return hash.hexdigest() # hexdigest returns the hexadecimal value of the salted hash value so it is equal to the value in the json file
+    salt = f"{username}{REALM_NAME}".encode()
+    password_bytes = password.encode()
+    hasher = SHA256.new()
+    hasher.update(salt)
+    hasher.update(password_bytes)
+    secret_key = hasher.digest()
+    return secret_key # this value will match the hex value of the password in the json file once read in
 
 
 def encrypt(key: bytes, data: Any) -> bytes:
@@ -64,19 +68,20 @@ class AuthenticationServer:
         """if not it returns none for invalid username or password"""
         """Should return none when no messages are returned"""
 
-        # Message 1: client/TGS session key encrypted using client secret key (encrypt using secret key derived from username and password)
-        # if its in the user data base, create key, 
+        # if its in the user data base, create messages, else return none 
         if (username in self.users):
+            # Message 1: client/TGS session key encrypted using client secret key (encrypt using secret key derived from username and password)
             session_key = get_random_bytes(32)
             client_key = self.users[username]
             encrypted_session_key = encrypt(client_key, session_key)
+            # Message 2: TGT encrypted using shared key between AS and TGS
+            TGT = Ticket(username, session_key)
+            encrypted_TGT = encrypt(AS_TGS_SHARED_KEY, TGT)
+
+            return encrypted_session_key, encrypted_TGT
         else:
             return None
-        # Message 2: TGT encrypted using shared key between AS and TGS
-        TGT = Ticket(username, session_key)
-        encrypted_TGT = encrypt(AS_TGS_SHARED_KEY, TGT)
-
-        return encrypted_session_key, encrypted_TGT
+        
 
 
 class TicketGrantingServer:
@@ -89,11 +94,27 @@ class TicketGrantingServer:
     ) -> Optional[Tuple[bytes, bytes]]:
         """Requests service authorization from the ticket-granting server by using the given TGT and authenticator."""
         """need to compare the username of the message 3 (TGT) and username from message 4 (authenticator)"""
-        # Message 5: client/FS session key encrypted using client/TGS session key
-        #create new session key like done above in the AS
-        # Message 6: service ticket encrypted using shared key between TGS and FS
-        # create a Ticket and encrypt with TGS_FS_SHARED_KEY
-        pass
+        TGT_decrypted = decrypt(AS_TGS_SHARED_KEY, tgt_encrypted)
+        if (tgt_encrypted): # check if ticket was successfully decrypted
+            client_TGS_session_key = TGT_decrypted.session_key
+            authenticator_decrypted = decrypt(client_TGS_session_key, authenticator_encrypted)
+            if (authenticator_decrypted): # check if authenticator was successfully decrypted
+                username_TGT = TGT_decrypted.username
+                username_authenticator = authenticator_decrypted.username
+                if (username_TGT == username_authenticator):
+                    # Message 5: client/FS session key encrypted using client/TGS session key
+                    session_key = get_random_bytes(32)
+                    encrypted_session_key = encrypt(client_TGS_session_key, session_key)
+                    # Message 6: service ticket encrypted using shared key between TGS and FS
+                    TGT = Ticket(username_authenticator, session_key)
+                    encrypted_TGT_2 = encrypt(TGS_FS_SHARED_KEY, TGT)
+                    return encrypted_session_key, encrypted_TGT_2
+                else:
+                    return None
+            else:
+                return None
+        else:
+            return None
 
 
 class FileServer:
@@ -107,9 +128,23 @@ class FileServer:
     ) -> Optional[bytes]:
         """Requests the given file from the file server by using the given service ticket and authenticator as authorization."""
 
-        # Message 9: the file request response encrypted using the client/FS session key
-        # compare username from message_7 (ticket_encrypted) and message_8 (authenticator_encrypted)
-        #compare timestamps as well
+        decrypted_ticket = decrypt(TGS_FS_SHARED_KEY, ticket_encrypted)
+        if (decrypted_ticket): # check if ticket was successfully decrypted
+            client_FS_session_key = decrypted_ticket.session_key
+            authenticator_decrypted = decrypt(client_FS_session_key, authenticator_encrypted)
+            if (authenticator_decrypted):
+                #compare usernames and timestamps of TGT and authentication messages
+                if (authenticator_decrypted.username == decrypted_ticket.username and authenticator_decrypted.timestamp < decrypted_ticket.validity):
+                    # Message 9: the file request response encrypted using the client/FS session key
+                    with open(filename, 'r') as file:
+                        data = file.read()
+                    response = FileResponse(data, authenticator_decrypted.timestamp)
+                    message_9 = encrypt(client_FS_session_key, response)
+                    return message_9
+            else:
+                return None
+        else:
+            return None
         
 
 
@@ -132,31 +167,50 @@ class Client:
         """Gets the given file from the file server."""
         """client prints error messages if any stage of the kerberos fails"""
         authentication = AuthenticationServer().request_authentication(self.username)
-        if (authentication): #check if None was returned
+        if (authentication): # to check if None was returned
             # Message 3: client forwards message 2 (TGT) from AS to TGS (create)
             message_3 = authentication[1]
             
             # Message 4: authenticator encrypted using client/TGS session key (create)
             message_1 = authentication[0]
-            """might need to check for None return"""
             TGS_session_key = decrypt(self.secret_key, message_1)
-            client_authentication = Authenticator(self.username)
-            encrypted_client_authentication = encrypt(TGS_session_key, client_authentication) # message 4
-            # Send messages:
-            TGT_authentication = TicketGrantingServer().request_authorization(message_3, encrypted_client_authentication)
-            if (TGT_authentication):
-                # Message 7: client forwards message 6 (service ticket) from TGS to FS (create)
-                message_7 = TGT_authentication[1]
-                # Message 8: authenticator encrypted using client/FS session key (create)
-                message_5 = TGT_authentication[0]
-                """might need to check for None return"""
-                FS_session_key = decrypt(TGS_session_key, message_5)
-                #create authenticator to send to FS and encrypt with FS_session_key above
-                #send message to FS
-                # once received, compare timestamps of sent authentication and received timestamp from FileResponse object (using equality)
-                # then print data.
+            if (TGS_session_key): # check if decryption failed
+                client_authentication = Authenticator(self.username)
+                encrypted_client_authentication = encrypt(TGS_session_key, client_authentication) # message 4
+                # Send messages:
+                TGT_authentication = TicketGrantingServer().request_authorization(message_3, encrypted_client_authentication)
+                if (TGT_authentication):
+                    # Message 7: client forwards message 6 (service ticket) from TGS to FS (create)
+                    message_7 = TGT_authentication[1]
+                    
+                    message_5 = TGT_authentication[0]
+                    FS_session_key = decrypt(TGS_session_key, message_5)
+                    if (FS_session_key): # check if decryption failed
+                        # Message 8: authenticator encrypted using client/FS session key (create)
+                        FS_authenticator = Authenticator(self.username)
+                        message_8 = encrypt(FS_session_key, FS_authenticator) # encrypted Ticket 
+                        #send message to FS
+                        file_encrypted = FileServer().request_file(filename, message_7, message_8)
+                        if (file_encrypted):
+                            # once received, check if request was sucessful, then compare timestamps of sent authentication and received timestamp from FileResponse object (using equality)
+                            # then print data.
+                            file_decrypted = decrypt(FS_session_key, file_encrypted)
+                            if (file_decrypted):
+                                if (FS_authenticator.timestamp == file_decrypted.timestamp):
+                                    print(f"Retreived {filename} from FS:")
+                                    print(file_decrypted.data)
+                                else:
+                                    print("Failed due to invalid timestamp.")
+                            else:
+                                print("Failed to decrypt file from FS.")
+                        else:
+                            print("Failed to access FS.")
+                    else:
+                        print("Failed to decrypt FS session key.")
+                else:
+                    print("Failed to access TGS.")
             else:
-                print("something .........................................................")
+                print("Failed to decrypt TGS session key.")
         else:
             print("Failed to decrypt client/TGS session key.") 
 
