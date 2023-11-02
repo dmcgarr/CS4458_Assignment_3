@@ -23,36 +23,45 @@ def derive_secret_key(username: str, password: str) -> bytes:
     password so that two different encryption keys are generated for users
     with the same password.
     """
+    # create salt and encode to bytes
     salt = f"{username}{REALM_NAME}".encode()
+    # encode password to bytes
     password_bytes = password.encode()
-    hasher = SHA256.new()
-    hasher.update(salt)
-    hasher.update(password_bytes)
-    secret_key = hasher.digest()
+    # create hash
+    hash = SHA256.new()
+    # hash salt
+    hash.update(salt)
+    # hash password
+    hash.update(password_bytes)
+    # get the digest from the hash
+    secret_key = hash.digest()
     return secret_key # this value will match the hex value of the password in the json file once read in
 
 
 def encrypt(key: bytes, data: Any) -> bytes:
     """Encrypts the given data using AES."""
-    """use GCM for AES and dont forget the nonce"""
-    """use pickle to serialize the data from the json object"""
-    """should be able to encrypt any python object"""
+    # create cipher
     cipher = AES.new(key, AES.MODE_GCM)
+    # encrypt data
     ciphertext, tag = cipher.encrypt_and_digest(pickle.dumps(data))
+    # return bytestring of nonce, cipher and tag to use for decryption
     return cipher.nonce + ciphertext + tag
 
 
 def decrypt(key: bytes, data: bytes) -> Any:
     """Decrypts the given message using AES."""
-    """should retrun the exact object that was encrypted"""
-    """should also return none if the message was not authentic"""
+    # parse input for nonce, ciphertext and tag
     nonce, ciphertext, tag = data[0:16], data[16:-16], data[-16:]
+    # create cipher
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     try:
+        # decrypt data
         plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+        # load object data
         data = pickle.loads(plaintext)
         return data
     except(ValueError, pickle.UnpicklingError, EOFError):
+        # if theres an error with loading data from pickle, not verified or EOFError
         return None
 
 class AuthenticationServer:
@@ -64,20 +73,16 @@ class AuthenticationServer:
 
     def request_authentication(self, username: str) -> Optional[Tuple[bytes, bytes]]:
         """Requests authentication for the given user from the authentication server."""
-        """ checks whether the user is in the database, if so AS gets the clients"""
-        """if not it returns none for invalid username or password"""
-        """Should return none when no messages are returned"""
-
         # if its in the user data base, create messages, else return none 
         if (username in self.users):
             # Message 1: client/TGS session key encrypted using client secret key (encrypt using secret key derived from username and password)
+            # create session key and encrypt it
             session_key = get_random_bytes(32)
             client_key = self.users[username]
             encrypted_session_key = encrypt(client_key, session_key)
             # Message 2: TGT encrypted using shared key between AS and TGS
             TGT = Ticket(username, session_key)
             encrypted_TGT = encrypt(AS_TGS_SHARED_KEY, TGT)
-
             return encrypted_session_key, encrypted_TGT
         else:
             return None
@@ -93,15 +98,19 @@ class TicketGrantingServer:
         authenticator_encrypted: bytes,
     ) -> Optional[Tuple[bytes, bytes]]:
         """Requests service authorization from the ticket-granting server by using the given TGT and authenticator."""
-        """need to compare the username of the message 3 (TGT) and username from message 4 (authenticator)"""
+        # decrypt TGT
         TGT_decrypted = decrypt(AS_TGS_SHARED_KEY, tgt_encrypted)
         if (tgt_encrypted): # check if ticket was successfully decrypted
+            # get session key from decrypted TGT
             client_TGS_session_key = TGT_decrypted.session_key
+            # decrypt authentication
             authenticator_decrypted = decrypt(client_TGS_session_key, authenticator_encrypted)
             if (authenticator_decrypted): # check if authenticator was successfully decrypted
+                # get username from TGT
                 username_TGT = TGT_decrypted.username
+                # get username from authenticator
                 username_authenticator = authenticator_decrypted.username
-                if (username_TGT == username_authenticator):
+                if (username_TGT == username_authenticator): # check if usernames match
                     # Message 5: client/FS session key encrypted using client/TGS session key
                     session_key = get_random_bytes(32)
                     encrypted_session_key = encrypt(client_TGS_session_key, session_key)
@@ -127,13 +136,15 @@ class FileServer:
         authenticator_encrypted: bytes,
     ) -> Optional[bytes]:
         """Requests the given file from the file server by using the given service ticket and authenticator as authorization."""
-
+        # decrypt TGT
         decrypted_ticket = decrypt(TGS_FS_SHARED_KEY, ticket_encrypted)
         if (decrypted_ticket): # check if ticket was successfully decrypted
+            # get session key from decrypted message
             client_FS_session_key = decrypted_ticket.session_key
+            # decrypt authenticator
             authenticator_decrypted = decrypt(client_FS_session_key, authenticator_encrypted)
-            if (authenticator_decrypted):
-                #compare usernames and timestamps of TGT and authentication messages
+            if (authenticator_decrypted): # check if decryption failed
+                # compare usernames and timestamps of TGT and authentication messages
                 if (authenticator_decrypted.username == decrypted_ticket.username and authenticator_decrypted.timestamp < decrypted_ticket.validity):
                     # Message 9: the file request response encrypted using the client/FS session key
                     with open(filename, 'r') as file:
@@ -165,7 +176,7 @@ class Client:
 
     def get_file(self, filename: str):
         """Gets the given file from the file server."""
-        """client prints error messages if any stage of the kerberos fails"""
+        # send authentication to AS
         authentication = AuthenticationServer().request_authentication(self.username)
         if (authentication): # to check if None was returned
             # Message 3: client forwards message 2 (TGT) from AS to TGS (create)
@@ -182,7 +193,7 @@ class Client:
                 if (TGT_authentication):
                     # Message 7: client forwards message 6 (service ticket) from TGS to FS (create)
                     message_7 = TGT_authentication[1]
-                    
+                    # encrypted session key
                     message_5 = TGT_authentication[0]
                     FS_session_key = decrypt(TGS_session_key, message_5)
                     if (FS_session_key): # check if decryption failed
@@ -191,11 +202,10 @@ class Client:
                         message_8 = encrypt(FS_session_key, FS_authenticator) # encrypted Ticket 
                         #send message to FS
                         file_encrypted = FileServer().request_file(filename, message_7, message_8)
-                        if (file_encrypted):
-                            # once received, check if request was sucessful, then compare timestamps of sent authentication and received timestamp from FileResponse object (using equality)
-                            # then print data.
+                        if (file_encrypted): #check if file is not None
+                            #decrypt file using session key
                             file_decrypted = decrypt(FS_session_key, file_encrypted)
-                            if (file_decrypted):
+                            if (file_decrypted): #check if decryption was successful
                                 if (FS_authenticator.timestamp == file_decrypted.timestamp):
                                     print(f"Retreived {filename} from FS:")
                                     print(file_decrypted.data)
